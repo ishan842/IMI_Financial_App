@@ -270,92 +270,132 @@ COMPANIES = {**INDIAN_COMPANIES, **GLOBAL_COMPANIES}
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_real_data(ticker: str):
-    """Fetch real financials from Yahoo Finance. Returns (data, info, price_hist, is_real)."""
+    """
+    Fetch real financials from Yahoo Finance via yfinance.
+    Uses robust session with browser-like headers to work on Streamlit Cloud.
+    Returns (data_dict, info_dict, price_hist_df, is_real: bool)
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    # ── Browser-like session so Yahoo Finance accepts the request ────────────
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+    })
+    adapter = HTTPAdapter(max_retries=3)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+
     try:
-        stk = yf.Ticker(ticker)
-        info = stk.info or {}
+        stk  = yf.Ticker(ticker, session=session)
+
+        # ── Pull financials ──────────────────────────────────────────────────
         inc  = stk.financials
         bal  = stk.balance_sheet
         cf   = stk.cashflow
+        info = stk.info or {}
 
         if inc is None or inc.empty:
             return None, info, None, False
 
-        # Align columns
-        common = inc.columns
+        # ── Align date columns across all three statements ───────────────────
+        common = sorted(inc.columns)
         if not bal.empty:
-            common = common.intersection(bal.columns)
-        if not cf.empty:
-            common = common.intersection(cf.columns)
-        common = sorted(common)
+            common = sorted(inc.columns.intersection(bal.columns))
         if len(common) == 0:
             common = sorted(inc.columns)
 
         inc = inc[common]
-        bal = bal[common] if not bal.empty and all(c in bal.columns for c in common) else bal
-        cf  = cf[common]  if not cf.empty  and all(c in cf.columns  for c in common) else cf
+        if not bal.empty and all(c in bal.columns for c in common):
+            bal = bal[common]
+        if not cf.empty and all(c in cf.columns for c in common):
+            cf = cf[common]
 
         years = [c.year for c in common]
-        n = len(years)
+        n     = len(years)
 
         def get_row(df, *keys):
+            """Search df rows case-insensitively for any of keys; return values array."""
             if df is None or df.empty:
                 return np.zeros(n)
             for k in keys:
                 for idx in df.index:
                     if k.lower() in str(idx).lower():
-                        row = df.loc[idx].reindex(common).values.astype(float)
-                        return np.nan_to_num(row, nan=0.0)
+                        try:
+                            row = df.loc[idx].reindex(common).values.astype(float)
+                            return np.nan_to_num(row, nan=0.0)
+                        except Exception:
+                            continue
             return np.zeros(n)
 
-        rev  = get_row(inc, "Total Revenue","Revenue")
-        cogs = get_row(inc, "Cost Of Revenue","Cost of Goods")
+        # ── Income Statement ─────────────────────────────────────────────────
+        rev  = get_row(inc, "Total Revenue", "Revenue")
+        cogs = get_row(inc, "Cost Of Revenue", "Cost of Goods")
         gp   = get_row(inc, "Gross Profit")
-        if gp.sum() == 0: gp = rev - cogs
-        opex = get_row(inc, "Operating Expense","Total Operating Expenses")
-        ebit = get_row(inc, "Operating Income","Ebit","EBIT")
+        if gp.sum() == 0:   gp   = rev - cogs
+        opex = get_row(inc, "Operating Expense", "Total Operating Expenses")
+        ebit = get_row(inc, "Operating Income", "Ebit", "EBIT")
         if ebit.sum() == 0: ebit = gp - opex
-        int_ = np.abs(get_row(inc, "Interest Expense","Interest And Debt Expense"))
-        ebt  = get_row(inc, "Pretax Income","Income Before Tax")
-        if ebt.sum() == 0: ebt = ebit - int_
-        tax  = np.abs(get_row(inc, "Tax Provision","Income Tax Expense"))
+        int_ = np.abs(get_row(inc, "Interest Expense", "Interest And Debt Expense"))
+        ebt  = get_row(inc, "Pretax Income", "Income Before Tax")
+        if ebt.sum() == 0:  ebt  = ebit - int_
+        tax  = np.abs(get_row(inc, "Tax Provision", "Income Tax Expense"))
         ni   = get_row(inc, "Net Income")
 
-        ta  = get_row(bal, "Total Assets")
-        ca  = get_row(bal, "Current Assets","Total Current Assets")
-        cl  = get_row(bal, "Current Liabilities","Total Current Liabilities")
-        ltd = get_row(bal, "Long Term Debt","Long-Term Debt")
-        eq  = get_row(bal, "Stockholders Equity","Total Equity",
-                           "Common Stock Equity","Total Stockholder Equity")
+        # ── Balance Sheet ────────────────────────────────────────────────────
+        ta   = get_row(bal, "Total Assets")
+        ca   = get_row(bal, "Current Assets", "Total Current Assets")
+        cl   = get_row(bal, "Current Liabilities", "Total Current Liabilities")
+        ltd  = get_row(bal, "Long Term Debt", "Long-Term Debt")
+        eq   = get_row(bal, "Stockholders Equity", "Total Equity",
+                            "Common Stock Equity", "Total Stockholder Equity")
         if eq.sum() == 0 and ta.sum() > 0:
             eq = ta - cl - ltd
 
-        cfo = get_row(cf, "Operating Cash Flow","Cash From Operations",
-                          "Total Cash From Operating Activities")
-        cfi = get_row(cf, "Investing Cash Flow","Cash From Investing",
-                          "Total Cash From Investing Activities")
-        cff = get_row(cf, "Financing Cash Flow","Cash From Financing",
-                          "Total Cash From Financing Activities")
+        # ── Cash Flow ────────────────────────────────────────────────────────
+        cfo  = get_row(cf, "Operating Cash Flow", "Cash From Operations",
+                           "Total Cash From Operating Activities")
+        cfi  = get_row(cf, "Investing Cash Flow", "Cash From Investing",
+                           "Total Cash From Investing Activities")
+        cff  = get_row(cf, "Financing Cash Flow", "Cash From Financing",
+                           "Total Cash From Financing Activities")
 
-        scale = 1e9
+        # Guard: if revenue is all zeros something went wrong
+        if rev.sum() == 0:
+            return None, info, None, False
+
+        scale  = 1e9
         sh_val = info.get("sharesOutstanding", 1e9)
         shares = np.full(n, sh_val / scale)
 
-        hist = stk.history(period="5y", interval="1mo")
+        # ── Price history ────────────────────────────────────────────────────
+        try:
+            hist = stk.history(period="5y", interval="1mo")
+        except Exception:
+            hist = pd.DataFrame()
 
         data = dict(
             years=years,
-            revenue=rev/scale,    cogs=cogs/scale,     gross_profit=gp/scale,
-            opex=opex/scale,      ebit=ebit/scale,     interest=int_/scale,
-            ebt=ebt/scale,        tax=tax/scale,       net_income=ni/scale,
-            total_assets=ta/scale, current_assets=ca/scale,
+            revenue=rev/scale,         cogs=cogs/scale,     gross_profit=gp/scale,
+            opex=opex/scale,           ebit=ebit/scale,     interest=int_/scale,
+            ebt=ebt/scale,             tax=tax/scale,       net_income=ni/scale,
+            total_assets=ta/scale,     current_assets=ca/scale,
             current_liabilities=cl/scale, lt_debt=ltd/scale,
-            equity=eq/scale,      cfo=cfo/scale,       cfi=cfi/scale,
-            cff=cff/scale,        shares=shares,
+            equity=eq/scale,           cfo=cfo/scale,       cfi=cfi/scale,
+            cff=cff/scale,             shares=shares,
         )
         return data, info, hist, True
 
-    except Exception:
+    except Exception as e:
         return None, {}, None, False
 
 
@@ -588,24 +628,32 @@ data_badge = "🟢 LIVE DATA" if is_real else "🟡 SIMULATED DATA"
 mc_str     = (f"₹{mc*FX/1e7:,.0f} Cr" if is_inr else f"${mc/1e9:.1f}B") if mc else "N/A"
 price_str  = f"{CURR}{live_price*FX:,.1f}" if (is_inr and live_price) else (f"${live_price:,.2f}" if live_price else "N/A")
 
-st.markdown(f"""
-<div class="hero">
-  <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;'>
-    <div>
-      <div style='font-size:11px;color:#8892a4;letter-spacing:2px;text-transform:uppercase;'>Financial Statement Analysis</div>
-      <h1 style='margin:6px 0 10px;font-size:28px;color:#f0d080;'>{company_name}</h1>
-      <span class="badge">{data_badge}</span>
-      <span class="badge">📈 {len(f["years"])}-Year History</span>
-      <span class="badge">🏦 {len(modules)} Modules</span>
-      {"<span class='badge'>🏭 "+sector+"</span>" if sector else ""}
-    </div>
-    <div style='text-align:right;'>
-      <div style='font-size:11px;color:#8892a4;'>Current Price</div>
-      <div style='font-size:30px;font-weight:700;color:#1de9b6;'>{price_str}</div>
-      <div style='font-size:12px;color:#8892a4;'>Mkt Cap: {mc_str}</div>
-    </div>
-  </div>
-</div>""", unsafe_allow_html=True)
+# ── Hero: pre-compute all values before building HTML ─────────────────────
+_ny   = len(f["years"])
+_nm   = len(modules)
+_sb   = ('<span class="badge">🏭 ' + sector + '</span>') if sector else ""
+_hero = (
+    '<div class="hero">'
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;">'
+        '<div>'
+          '<div style="font-size:11px;color:#8892a4;letter-spacing:2px;text-transform:uppercase;">'
+            'Financial Statement Analysis'
+          '</div>'
+          '<h1 style="margin:6px 0 10px;font-size:28px;color:#f0d080;">' + company_name + '</h1>'
+          '<span class="badge">' + data_badge + '</span> '
+          '<span class="badge">📈 ' + str(_ny) + '-Year History</span> '
+          '<span class="badge">🏦 ' + str(_nm) + ' Modules</span> '
+          + _sb +
+        '</div>'
+        '<div style="text-align:right;">'
+          '<div style="font-size:11px;color:#8892a4;">Current Price</div>'
+          '<div style="font-size:30px;font-weight:700;color:#1de9b6;">' + price_str + '</div>'
+          '<div style="font-size:12px;color:#8892a4;">Mkt Cap: ' + mc_str + '</div>'
+        '</div>'
+      '</div>'
+    '</div>'
+)
+st.markdown(_hero, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  KPI CARDS
